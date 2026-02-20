@@ -5,8 +5,10 @@ FastAPI routes for the Gaia Orchestrator wiki-creation service.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
+import re
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request as FastAPIRequest, status
@@ -431,22 +433,24 @@ async def _fetch_wiki_payload_from_task(task_id: str, settings) -> dict | None:
     )
     try:
         task = await client.get_task(task_id)
-        description = task.get("description", "") or ""
-        log.info(
-            "Webhook: fetched task '%s', description length=%d",
-            task.get("name", "?"),
-            len(description),
-        )
-        if description:
-            return _try_parse_wiki_json(description)
-        # Also check markdown_description (some ClickUp versions)
-        md_desc = task.get("markdown_description", "") or ""
-        if md_desc:
-            return _try_parse_wiki_json(md_desc)
-        # Also try text_content
-        text = task.get("text_content", "") or ""
-        if text:
-            return _try_parse_wiki_json(text)
+        task_name = task.get("name", "?")
+
+        # Try each text field — text_content is plain text (most reliable),
+        # then description, then markdown_description
+        for field_name in ("text_content", "description", "markdown_description"):
+            text = task.get(field_name, "") or ""
+            if not text:
+                continue
+            log.info(
+                "Webhook: task '%s' field '%s' (%d chars): %.300s",
+                task_name, field_name, len(text), text,
+            )
+            result = _try_parse_wiki_json(text)
+            if result:
+                log.info("Webhook: parsed wiki JSON from task field '%s'", field_name)
+                return result
+
+        log.warning("Webhook: no wiki JSON found in any task field for '%s'", task_name)
         return None
     except Exception as exc:
         log.error("Webhook: failed to fetch task %s: %s", task_id, exc)
@@ -496,27 +500,50 @@ def _find_wiki_payload_in_text(text: str) -> dict | None:
     return _try_parse_wiki_json(text)
 
 
+def _clean_rich_text(text: str) -> str:
+    """
+    Clean up rich-text artifacts that ClickUp might inject into
+    task descriptions before we try to parse JSON from them.
+    """
+    # Strip HTML tags (e.g. <a href="...">url</a> → url)
+    text = re.sub(r"<[^>]+>", "", text)
+    # Unescape HTML entities (&quot; → ", &amp; → &, etc.)
+    text = html.unescape(text)
+    # Replace unicode smart quotes with ASCII equivalents
+    text = text.replace("\u201c", '"').replace("\u201d", '"')  # " "
+    text = text.replace("\u2018", "'").replace("\u2019", "'")  # ' '
+    # Normalize whitespace (non-breaking spaces, zero-width chars)
+    text = text.replace("\u00a0", " ").replace("\u200b", "")
+    # Strip leading/trailing whitespace
+    text = text.strip()
+    return text
+
+
 def _try_parse_wiki_json(text: str) -> dict | None:
     """Try to extract a valid wiki JSON payload from a string."""
-    text = text.strip()
+    # Try on the original text first, then on a cleaned version
+    for attempt_text in [text.strip(), _clean_rich_text(text)]:
+        if not attempt_text:
+            continue
 
-    # Try direct parse
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict) and "pages" in data:
-            return data
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Try to find JSON object in the text (agent might add extra text around it)
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end > start:
+        # Try direct parse
         try:
-            data = json.loads(text[start:end + 1])
+            data = json.loads(attempt_text)
             if isinstance(data, dict) and "pages" in data:
                 return data
         except (json.JSONDecodeError, ValueError):
             pass
+
+        # Try to find JSON object in the text (agent might add extra text around it)
+        start = attempt_text.find("{")
+        end = attempt_text.rfind("}")
+        if start != -1 and end > start:
+            candidate = attempt_text[start:end + 1]
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict) and "pages" in data:
+                    return data
+            except (json.JSONDecodeError, ValueError):
+                pass
 
     return None
