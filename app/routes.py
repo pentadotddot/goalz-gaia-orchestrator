@@ -511,6 +511,7 @@ def _clean_rich_text(text: str) -> str:
     text = html.unescape(text)
     # Replace unicode smart quotes with ASCII equivalents
     text = text.replace("\u201c", '"').replace("\u201d", '"')  # " "
+    text = text.replace("\u201e", '"')                          # „ (Hungarian)
     text = text.replace("\u2018", "'").replace("\u2019", "'")  # ' '
     # Normalize whitespace (non-breaking spaces, zero-width chars)
     text = text.replace("\u00a0", " ").replace("\u200b", "")
@@ -519,44 +520,57 @@ def _clean_rich_text(text: str) -> str:
     return text
 
 
-def _repair_json_strings(text: str) -> str:
+def _repair_json(text: str, max_fixes: int = 5000) -> str:
     """
-    Fix literal newlines/tabs inside JSON string values.
+    Iteratively repair invalid JSON by fixing errors at the exact position
+    reported by Python's ``json.loads()``.
 
-    ClickUp's ``description`` field renders ``\\n`` escape sequences as
-    actual newline characters.  JSON strings cannot contain unescaped
-    newlines, so ``json.loads()`` fails.  This function walks the text
-    character-by-character, tracks whether it is inside a quoted string,
-    and re-escapes ``\\n``, ``\\r``, ``\\t`` that appear inside strings
-    while leaving structural whitespace untouched.
+    This is far more robust than the old approach of tracking string
+    boundaries character-by-character, because ClickUp may alter escape
+    sequences (``\\n`` → real newline, ``\\"`` → ``"``, ``\\t`` → tab, etc.)
+    and the manual tracker can desync.  Here the JSON decoder itself tells
+    us **what** is wrong and **where**, and we patch it.
+
+    Handled repairs:
+      - *Invalid control characters* inside strings (newlines, carriage
+        returns, tabs, and other control chars).
+      - *Invalid ``\\escape``* sequences (e.g. ``\\P`` → ``\\\\P``).
+      - *Trailing commas* before ``}`` or ``]``.
     """
-    result: list[str] = []
-    in_string = False
-    escape_next = False
-    for ch in text:
-        if escape_next:
-            result.append(ch)
-            escape_next = False
-            continue
-        if ch == "\\" and in_string:
-            result.append(ch)
-            escape_next = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            result.append(ch)
-            continue
-        if in_string:
-            if ch == "\n":
-                result.append("\\n")
-                continue
-            if ch == "\r":
-                continue          # drop CR (keep only \n)
-            if ch == "\t":
-                result.append("\\t")
-                continue
-        result.append(ch)
-    return "".join(result)
+    # Pre-pass: remove trailing commas (common with LLM-generated JSON)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+
+    for _ in range(max_fixes):
+        try:
+            json.loads(text)
+            return text
+        except json.JSONDecodeError as e:
+            pos = e.pos
+            if pos is None or pos < 0 or pos > len(text):
+                break
+
+            if "Invalid control character" in e.msg and pos < len(text):
+                ch = text[pos]
+                repl = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}.get(ch, "")
+                text = text[:pos] + repl + text[pos + 1:]
+
+            elif "Invalid \\escape" in e.msg and pos < len(text):
+                # pos points to the char after the backslash; insert an
+                # extra backslash so \X becomes \\X (literal backslash).
+                text = text[:pos] + "\\" + text[pos:]
+
+            else:
+                # Structural error we cannot auto-fix — log and bail out
+                snippet = text[max(0, pos - 30) : pos + 40]
+                log.warning(
+                    "JSON repair: unfixable at pos %d: %s – …%s…",
+                    pos,
+                    e.msg,
+                    snippet.replace("\n", "↵"),
+                )
+                break
+
+    return text
 
 
 def _normalize_pages(pages: list) -> list:
@@ -616,7 +630,7 @@ def _try_parse_wiki_json(text: str) -> dict | None:
         if not block:
             continue
         # Try raw, then repaired (ClickUp may render \n inside strings)
-        for candidate in [block, _repair_json_strings(block)]:
+        for candidate in [block, _repair_json(block)]:
             try:
                 data = json.loads(candidate)
                 if isinstance(data, dict) and "pages" in data:
@@ -625,8 +639,17 @@ def _try_parse_wiki_json(text: str) -> dict | None:
             except (json.JSONDecodeError, ValueError):
                 pass
 
-    # ── Strategies 1-2: direct parse / substring extraction ──
-    for attempt_text in [text.strip(), _clean_rich_text(text)]:
+    # ── Strategies 1+: direct parse / substring extraction / repair ──
+    #
+    # We try the raw text first, then the rich-text-cleaned version.
+    # For each, we try: direct parse → substring extraction → repair.
+    last_error: json.JSONDecodeError | None = None
+    last_candidate: str = ""
+
+    for label, attempt_text in [
+        ("raw", text.strip()),
+        ("cleaned", _clean_rich_text(text)),
+    ]:
         if not attempt_text:
             continue
 
@@ -638,27 +661,47 @@ def _try_parse_wiki_json(text: str) -> dict | None:
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # Try to find JSON object in the text (agent might add extra text around it)
+        # Try to find JSON object in the text
         start = attempt_text.find("{")
         end = attempt_text.rfind("}")
-        if start != -1 and end > start:
-            candidate = attempt_text[start:end + 1]
-            try:
-                data = json.loads(candidate)
-                if isinstance(data, dict) and "pages" in data:
-                    return _normalize_wiki_payload(data)
-            except (json.JSONDecodeError, ValueError):
-                pass
+        if start == -1 or end <= start:
+            continue
 
-            # Fallback: repair literal newlines inside JSON string values
-            # (ClickUp renders \n as actual line breaks in descriptions)
-            try:
-                repaired = _repair_json_strings(candidate)
-                data = json.loads(repaired)
-                if isinstance(data, dict) and "pages" in data:
-                    log.debug("Parsed wiki JSON after repairing newlines in strings")
-                    return _normalize_wiki_payload(data)
-            except (json.JSONDecodeError, ValueError):
-                pass
+        candidate = attempt_text[start:end + 1]
+
+        # Try raw candidate
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and "pages" in data:
+                return _normalize_wiki_payload(data)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Try iterative repair (handles control chars + invalid escapes)
+        try:
+            repaired = _repair_json(candidate)
+            data = json.loads(repaired)
+            if isinstance(data, dict) and "pages" in data:
+                log.info("Parsed wiki JSON after iterative repair (%s)", label)
+                return _normalize_wiki_payload(data)
+        except (json.JSONDecodeError, ValueError) as exc:
+            last_error = exc if isinstance(exc, json.JSONDecodeError) else None
+            last_candidate = repaired
+
+    # ── Nothing worked — log details so we can diagnose remotely ──
+    if last_error and last_candidate:
+        pos = last_error.pos or 0
+        snippet = last_candidate[max(0, pos - 40) : pos + 60].replace("\n", "↵")
+        log.warning(
+            "JSON parse failed after all strategies: %s at pos %d – …%s…",
+            last_error.msg,
+            pos,
+            snippet,
+        )
+        log.warning(
+            "Candidate length: %d chars, first 200: %.200s",
+            len(last_candidate),
+            last_candidate.replace("\n", "↵"),
+        )
 
     return None
