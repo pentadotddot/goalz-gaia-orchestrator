@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request as FastAPIRequest, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request as FastAPIRequest, status
 from fastapi.responses import PlainTextResponse
 
 from app.config import Settings, get_settings
@@ -247,30 +247,6 @@ async def create_wiki_get(
 )
 async def webhook_clickup(
     raw_request: FastAPIRequest,
-    payload: dict = Body(
-        default={},
-        examples=[
-            {
-                "doc_name": "Test Wiki",
-                "target": {
-                    "url": "https://app.clickup.com/90151997238/v/dc/2kyqmktp-35355/2kyqmktp-581535"
-                },
-                "pages": [
-                    {
-                        "title": "Welcome",
-                        "content": "# Welcome\n\nTest wiki page.",
-                        "children": [
-                            {
-                                "title": "Getting Started",
-                                "content": "## Getting Started\n\nChild page.",
-                                "children": [],
-                            }
-                        ],
-                    }
-                ],
-            }
-        ],
-    ),
     settings: Settings = Depends(get_settings),
 ):
     """
@@ -297,11 +273,6 @@ async def webhook_clickup(
             request_data = parsed[0]
     except (json.JSONDecodeError, ValueError):
         log.info("Webhook: body is not JSON, treating as raw text")
-
-    # Also check query parameters
-    for key, value in raw_request.query_params.items():
-        if key not in request_data:
-            request_data[key] = value
 
     if not settings.clickup_api_key:
         raise HTTPException(status_code=500, detail="CLICKUP_API_KEY not configured")
@@ -398,42 +369,56 @@ async def webhook_clickup(
     }
 
 
+def _is_valid_task_id(val) -> bool:
+    """Check if a value looks like a real ClickUp task ID (alphanumeric, 5+ chars)."""
+    if not val:
+        return False
+    s = str(val).strip()
+    # Reject empty, template placeholders like "{}", "{{Task ID}}", UUIDs
+    if not s or s in ("{}", "null", "undefined") or s.startswith("{{"):
+        return False
+    if len(s) < 5:
+        return False
+    # ClickUp task IDs are typically 9-char alphanumeric (e.g. "86c8ce274")
+    return True
+
+
 def _extract_task_id(data: dict) -> str | None:
     """
     Try to extract a ClickUp task ID from the webhook body.
 
-    ClickUp Automation webhooks may send the task ID in various locations:
+    ClickUp Automation webhooks send the task data in:
+      - data["payload"]["id"]   ← most common (ClickUp Automation format)
       - data["task_id"]
-      - data["payload"]["id"]
-      - data["history_items"][0]["after"]["id"]
       - data["task"]["id"]
-      - or just data["id"] if the whole body is the task
+      - data["history_items"][0]["after"]["id"]
     """
-    # Direct task_id field
+    # Priority 1: payload.id (ClickUp Automation webhook format)
+    payload_obj = data.get("payload")
+    if isinstance(payload_obj, dict):
+        tid = payload_obj.get("id")
+        if _is_valid_task_id(tid):
+            return str(tid)
+
+    # Priority 2: direct task_id / taskId field
     for key in ("task_id", "taskId"):
         val = data.get(key)
-        if val and isinstance(val, str):
-            return val
+        if _is_valid_task_id(val):
+            return str(val)
 
-    # Nested: payload.id, task.id
-    for container_key in ("payload", "task"):
-        container = data.get(container_key)
-        if isinstance(container, dict):
-            tid = container.get("id")
-            if tid and isinstance(tid, str):
-                return str(tid)
+    # Priority 3: task.id
+    task_obj = data.get("task")
+    if isinstance(task_obj, dict):
+        tid = task_obj.get("id")
+        if _is_valid_task_id(tid):
+            return str(tid)
 
-    # history_items[0].after.id  (ClickUp webhook v2 format)
+    # Priority 4: history_items[0].after.id (ClickUp webhook v2 format)
     history = data.get("history_items")
     if isinstance(history, list) and history:
         after = history[0].get("after") if isinstance(history[0], dict) else None
-        if isinstance(after, dict) and after.get("id"):
+        if isinstance(after, dict) and _is_valid_task_id(after.get("id")):
             return str(after["id"])
-
-    # Top-level id (if the whole body IS a task-like object)
-    top_id = data.get("id")
-    if top_id and isinstance(top_id, str) and len(top_id) > 4:
-        return top_id
 
     return None
 

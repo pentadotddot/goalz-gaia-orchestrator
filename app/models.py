@@ -19,12 +19,14 @@ log = logging.getLogger(__name__)
 
 # ── ClickUp URL parser ──────────────────────────────────────────────
 
-# Doc URL:   https://app.clickup.com/{team_id}/v/dc/{doc_id}/{page_id}
+# Doc URL formats:
+#   https://app.clickup.com/{team_id}/v/dc/{doc_id}/{page_id}
+#   https://app.clickup.com/{team_id}/docs/{doc_id}/{page_id}
 # Space URL: https://app.clickup.com/{team_id}/v/s/{space_id}
 # List URL:  https://app.clickup.com/{team_id}/v/li/{list_id}
 
 _CLICKUP_DOC_RE = re.compile(
-    r"https?://app\.clickup\.com/(?P<team_id>[^/]+)/v/dc/(?P<doc_id>[^/]+)(?:/(?P<page_id>[^/?\s]+))?"
+    r"https?://app\.clickup\.com/(?P<team_id>[^/]+)/(?:v/dc|docs)/(?P<doc_id>[^/]+)(?:/(?P<page_id>[^/?\s]+))?"
 )
 _CLICKUP_SPACE_RE = re.compile(
     r"https?://app\.clickup\.com/(?P<team_id>[^/]+)/v/s/(?P<space_id>[^/?\s]+)"
@@ -37,7 +39,9 @@ def parse_clickup_url(url: str) -> dict:
 
     Supported formats:
       - Doc page:  https://app.clickup.com/90151997238/v/dc/2kyqmktp-35355/2kyqmktp-581535
+      - Doc page:  https://app.clickup.com/90151997238/docs/2kyqmktp-35355/2kyqmktp-581535
       - Doc root:  https://app.clickup.com/90151997238/v/dc/2kyqmktp-35355
+      - Doc root:  https://app.clickup.com/90151997238/docs/2kyqmktp-35355
       - Space:     https://app.clickup.com/90151997238/v/s/90152044016
 
     Returns dict with extracted fields (only non-None values).
