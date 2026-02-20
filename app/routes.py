@@ -21,6 +21,7 @@ from app.models import (
     WikiPage,
     JobStatus,
 )
+from app.clickup_client import ClickUpClient
 from app.wiki_builder import get_job, list_jobs, run_wiki_creation
 
 log = logging.getLogger(__name__)
@@ -302,6 +303,9 @@ async def webhook_clickup(
         if key not in request_data:
             request_data[key] = value
 
+    if not settings.clickup_api_key:
+        raise HTTPException(status_code=500, detail="CLICKUP_API_KEY not configured")
+
     # ── Test webhook detection ──
     # ClickUp test webhooks send sample/placeholder data.
     # Accept them with 200 so the test passes.
@@ -309,7 +313,6 @@ async def webhook_clickup(
         not body_text.strip()
         or body_text.strip() in ("{}", "[]", "null", "test")
         or request_data.get("event") == "test"
-        or (not _find_wiki_payload(request_data) and not _find_wiki_payload_in_text(body_text))
     )
 
     if is_test and "pages" not in request_data:
@@ -319,35 +322,50 @@ async def webhook_clickup(
             "message": "Webhook received successfully. Send a task with wiki JSON in the description to create pages.",
         }
 
-    if not settings.clickup_api_key:
-        raise HTTPException(status_code=500, detail="CLICKUP_API_KEY not configured")
-
     # ── Find the wiki payload ──
 
-    # Priority 1: "payload" query parameter (from ClickUp URL Parameters + Task Description tag)
     wiki_payload = None
-    payload_param = raw_request.query_params.get("payload", "")
-    if payload_param:
-        log.info("Webhook: found 'payload' query param (%d chars)", len(payload_param))
-        wiki_payload = _try_parse_wiki_json(payload_param)
-        if wiki_payload:
-            log.info("Webhook: extracted wiki JSON from 'payload' query param")
 
-    # Priority 2: look inside the parsed request body
+    # Priority 1: body IS the wiki payload (direct Swagger / manual test)
+    wiki_payload = _find_wiki_payload(request_data)
+    if wiki_payload:
+        log.info("Webhook: found wiki payload directly in request body")
+
+    # Priority 2: "payload" query parameter
     if not wiki_payload:
-        wiki_payload = _find_wiki_payload(request_data)
+        payload_param = raw_request.query_params.get("payload", "")
+        if payload_param:
+            log.info("Webhook: found 'payload' query param (%d chars)", len(payload_param))
+            wiki_payload = _try_parse_wiki_json(payload_param)
+            if wiki_payload:
+                log.info("Webhook: extracted wiki JSON from 'payload' query param")
 
     # Priority 3: scan the raw body text
     if not wiki_payload:
         wiki_payload = _find_wiki_payload_in_text(body_text)
+        if wiki_payload:
+            log.info("Webhook: found wiki JSON in raw body text")
+
+    # Priority 4: extract task_id from the webhook body and fetch description from ClickUp API
+    if not wiki_payload:
+        task_id = _extract_task_id(request_data)
+        if task_id:
+            log.info("Webhook: found task_id=%s, fetching description from ClickUp API…", task_id)
+            wiki_payload = await _fetch_wiki_payload_from_task(task_id, settings)
+            if wiki_payload:
+                log.info("Webhook: extracted wiki JSON from task description (via API)")
+            else:
+                log.warning("Webhook: task %s description did not contain valid wiki JSON", task_id)
+        else:
+            log.info("Webhook: no task_id found in webhook body")
 
     if not wiki_payload:
         log.warning("Webhook: no wiki payload found – returning guidance")
         return {
             "status": "ignored",
             "message": (
-                "No wiki JSON payload found in the webhook data. "
-                "The task description should contain JSON like: "
+                "No wiki JSON payload found. Ensure the task description "
+                "contains JSON like: "
                 '{"doc_name": "...", "target": {"url": "..."}, "pages": [...]}'
             ),
         }
@@ -378,6 +396,78 @@ async def webhook_clickup(
         "total_pages": total,
         "message": "Wiki creation started",
     }
+
+
+def _extract_task_id(data: dict) -> str | None:
+    """
+    Try to extract a ClickUp task ID from the webhook body.
+
+    ClickUp Automation webhooks may send the task ID in various locations:
+      - data["task_id"]
+      - data["payload"]["id"]
+      - data["history_items"][0]["after"]["id"]
+      - data["task"]["id"]
+      - or just data["id"] if the whole body is the task
+    """
+    # Direct task_id field
+    for key in ("task_id", "taskId"):
+        val = data.get(key)
+        if val and isinstance(val, str):
+            return val
+
+    # Nested: payload.id, task.id
+    for container_key in ("payload", "task"):
+        container = data.get(container_key)
+        if isinstance(container, dict):
+            tid = container.get("id")
+            if tid and isinstance(tid, str):
+                return str(tid)
+
+    # history_items[0].after.id  (ClickUp webhook v2 format)
+    history = data.get("history_items")
+    if isinstance(history, list) and history:
+        after = history[0].get("after") if isinstance(history[0], dict) else None
+        if isinstance(after, dict) and after.get("id"):
+            return str(after["id"])
+
+    # Top-level id (if the whole body IS a task-like object)
+    top_id = data.get("id")
+    if top_id and isinstance(top_id, str) and len(top_id) > 4:
+        return top_id
+
+    return None
+
+
+async def _fetch_wiki_payload_from_task(task_id: str, settings) -> dict | None:
+    """Fetch a task from ClickUp by ID and try to parse wiki JSON from its description."""
+    client = ClickUpClient(
+        api_key=settings.clickup_api_key,
+        base_url=settings.clickup_api_base,
+    )
+    try:
+        task = await client.get_task(task_id)
+        description = task.get("description", "") or ""
+        log.info(
+            "Webhook: fetched task '%s', description length=%d",
+            task.get("name", "?"),
+            len(description),
+        )
+        if description:
+            return _try_parse_wiki_json(description)
+        # Also check markdown_description (some ClickUp versions)
+        md_desc = task.get("markdown_description", "") or ""
+        if md_desc:
+            return _try_parse_wiki_json(md_desc)
+        # Also try text_content
+        text = task.get("text_content", "") or ""
+        if text:
+            return _try_parse_wiki_json(text)
+        return None
+    except Exception as exc:
+        log.error("Webhook: failed to fetch task %s: %s", task_id, exc)
+        return None
+    finally:
+        await client.close()
 
 
 def _find_wiki_payload(data: dict) -> dict | None:

@@ -103,6 +103,10 @@ class ClickUpClient:
         data = await self._get(f"{self.base_url}/api/v2/user")
         return data.get("user", {})
 
+    async def get_task(self, task_id: str) -> dict:
+        """Fetch a single task by ID (v2). Returns the full task dict."""
+        return await self._get(f"{self.base_url}/api/v2/task/{task_id}")
+
     # ── Docs API (v3) ──────────────────────────────────────────────
 
     async def create_doc(
