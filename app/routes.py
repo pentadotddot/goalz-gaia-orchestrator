@@ -131,7 +131,7 @@ def _build_pages(raw: list[dict]) -> list[WikiPage]:
     for p in raw:
         out.append(WikiPage(
             title=p.get("title", "Untitled"),
-            content=p.get("content", ""),
+            content=p.get("content", "") or p.get("summary", ""),
             children=_build_pages(p.get("children", [])),
         ))
     return out
@@ -519,9 +519,71 @@ def _clean_rich_text(text: str) -> str:
     return text
 
 
+def _normalize_pages(pages: list) -> list:
+    """Recursively normalise page dicts coming from the agent."""
+    out = []
+    for p in pages:
+        if not isinstance(p, dict):
+            continue
+        # Map "summary" → "content" if content is missing
+        if "content" not in p and "summary" in p:
+            p["content"] = p.pop("summary")
+        p["children"] = _normalize_pages(p.get("children", []))
+        out.append(p)
+    return out
+
+
+def _normalize_wiki_payload(data: dict) -> dict:
+    """
+    Remap non-standard field names the ClickUp agent might use so they
+    match the expected WikiCreateRequest schema.
+
+    Handled mappings:
+      - ``target_url`` (str)  →  ``target: {"url": ...}``
+      - ``summary`` → ``content``  in every page (recursive)
+    """
+    # target_url → target
+    if "target_url" in data and "target" not in data:
+        data["target"] = {"url": data.pop("target_url")}
+
+    # Ensure target is a dict (agent might pass a bare URL string)
+    if isinstance(data.get("target"), str):
+        data["target"] = {"url": data["target"]}
+
+    # Normalise pages
+    if "pages" in data and isinstance(data["pages"], list):
+        data["pages"] = _normalize_pages(data["pages"])
+
+    return data
+
+
 def _try_parse_wiki_json(text: str) -> dict | None:
-    """Try to extract a valid wiki JSON payload from a string."""
-    # Try on the original text first, then on a cleaned version
+    """Try to extract a valid wiki JSON payload from a string.
+
+    Strategy order:
+      1. Extract from fenced code blocks (```...```) — most reliable when
+         the agent wraps its JSON in a code block.
+      2. Direct ``json.loads`` on the whole text.
+      3. ``find("{")`` / ``rfind("}")`` substring extraction.
+    Each strategy is tried on both the raw text and a cleaned version.
+    """
+
+    # ── Strategy 0: fenced code blocks ──
+    # Match ```json ... ``` or ``` ... ``` (with optional language tag)
+    code_blocks = re.findall(r"```(?:\w*\n|\n)?(.*?)```", text, re.DOTALL)
+    for block in code_blocks:
+        block = block.strip()
+        if not block:
+            continue
+        try:
+            data = json.loads(block)
+            if isinstance(data, dict) and "pages" in data:
+                log.debug("Parsed wiki JSON from fenced code block")
+                return _normalize_wiki_payload(data)
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # ── Strategies 1-2: direct parse / substring extraction ──
     for attempt_text in [text.strip(), _clean_rich_text(text)]:
         if not attempt_text:
             continue
@@ -530,7 +592,7 @@ def _try_parse_wiki_json(text: str) -> dict | None:
         try:
             data = json.loads(attempt_text)
             if isinstance(data, dict) and "pages" in data:
-                return data
+                return _normalize_wiki_payload(data)
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -542,7 +604,7 @@ def _try_parse_wiki_json(text: str) -> dict | None:
             try:
                 data = json.loads(candidate)
                 if isinstance(data, dict) and "pages" in data:
-                    return data
+                    return _normalize_wiki_payload(data)
             except (json.JSONDecodeError, ValueError):
                 pass
 
