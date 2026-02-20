@@ -234,3 +234,125 @@ async def create_wiki_get(
         lines.append(f"\nError: {job.error}")
 
     return PlainTextResponse("\n".join(lines))
+
+
+# ── Webhook endpoint (for ClickUp Automations) ──────────────────
+
+
+@router.post(
+    "/webhook/clickup",
+    summary="Receive webhook from ClickUp Automation",
+    tags=["webhook"],
+)
+async def webhook_clickup(
+    request: dict,
+    settings: Settings = Depends(get_settings),
+):
+    """
+    Receives a webhook POST from a ClickUp Automation.
+
+    The SuperAgent creates a task with the wiki JSON payload in the
+    task description. The automation fires this webhook, and we
+    extract the JSON from the task description field.
+
+    Tries multiple strategies to find the wiki payload:
+      1. Direct WikiCreateRequest format (body IS the payload)
+      2. Task description field containing JSON
+      3. Any string field containing valid wiki JSON
+    """
+    if not settings.clickup_api_key:
+        raise HTTPException(status_code=500, detail="CLICKUP_API_KEY not configured")
+
+    log.info("Webhook received: %s", json.dumps(request, default=str)[:500])
+
+    wiki_payload = None
+
+    # Strategy 1: body is already our WikiCreateRequest format
+    if "pages" in request and "target" in request:
+        wiki_payload = request
+        log.info("Webhook: payload is direct WikiCreateRequest format")
+
+    # Strategy 2: look for task description containing JSON
+    if not wiki_payload:
+        description = (
+            request.get("task_description")
+            or request.get("description")
+            or request.get("Task Description")
+            or ""
+        )
+        if description:
+            wiki_payload = _try_parse_wiki_json(description)
+            if wiki_payload:
+                log.info("Webhook: extracted payload from task description")
+
+    # Strategy 3: scan all string values for valid wiki JSON
+    if not wiki_payload:
+        for key, value in request.items():
+            if isinstance(value, str) and len(value) > 20:
+                wiki_payload = _try_parse_wiki_json(value)
+                if wiki_payload:
+                    log.info("Webhook: extracted payload from field '%s'", key)
+                    break
+
+    if not wiki_payload:
+        log.error("Webhook: could not find wiki payload in request")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Could not find wiki JSON payload in the webhook data. "
+                "Make sure the task description contains the full wiki JSON: "
+                '{"doc_name": "...", "target": {"url": "..."}, "pages": [...]}'
+            ),
+        )
+
+    # Build request and start job
+    try:
+        pages = _build_pages(wiki_payload.get("pages", []))
+        target_data = wiki_payload.get("target", {})
+        if isinstance(target_data, str):
+            target_data = {"url": target_data}
+
+        wiki_request = WikiCreateRequest(
+            doc_name=wiki_payload.get("doc_name", "Wiki"),
+            target=TargetLocation(**target_data),
+            pages=pages,
+        )
+    except Exception as e:
+        log.error("Webhook: invalid payload structure: %s", e)
+        raise HTTPException(status_code=400, detail=f"Invalid wiki payload: {e}")
+
+    job_id = await run_wiki_creation(wiki_request, settings)
+    log.info("Webhook: job %s started (%d pages)", job_id, _count_pages(pages))
+
+    return {
+        "status": "accepted",
+        "job_id": job_id,
+        "total_pages": _count_pages(pages),
+        "message": "Wiki creation started",
+    }
+
+
+def _try_parse_wiki_json(text: str) -> dict | None:
+    """Try to extract a valid wiki JSON payload from a string."""
+    text = text.strip()
+
+    # Try direct parse
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict) and "pages" in data:
+            return data
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try to find JSON object in the text (agent might add extra text around it)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(text[start:end + 1])
+            if isinstance(data, dict) and "pages" in data:
+                return data
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    return None
