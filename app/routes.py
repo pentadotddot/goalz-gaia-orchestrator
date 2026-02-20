@@ -535,11 +535,16 @@ def _repair_json(text: str, max_fixes: int = 5000) -> str:
       - *Invalid control characters* inside strings (newlines, carriage
         returns, tabs, and other control chars).
       - *Invalid ``\\escape``* sequences (e.g. ``\\P`` → ``\\\\P``).
+      - *Unescaped quotes* inside string values — ClickUp renders ``\\"``
+        as plain ``"`` in ``text_content``, which prematurely closes the
+        JSON string.  We detect this via "Expecting ',' delimiter" and
+        re-escape the offending ``"``.
       - *Trailing commas* before ``}`` or ``]``.
     """
     # Pre-pass: remove trailing commas (common with LLM-generated JSON)
     text = re.sub(r",(\s*[}\]])", r"\1", text)
 
+    prev_pos = -1
     for _ in range(max_fixes):
         try:
             json.loads(text)
@@ -548,6 +553,10 @@ def _repair_json(text: str, max_fixes: int = 5000) -> str:
             pos = e.pos
             if pos is None or pos < 0 or pos > len(text):
                 break
+            # Safety: if we're stuck at the same position, bail out
+            if pos == prev_pos:
+                break
+            prev_pos = pos
 
             if "Invalid control character" in e.msg and pos < len(text):
                 ch = text[pos]
@@ -558,6 +567,29 @@ def _repair_json(text: str, max_fixes: int = 5000) -> str:
                 # pos points to the char after the backslash; insert an
                 # extra backslash so \X becomes \\X (literal backslash).
                 text = text[:pos] + "\\" + text[pos:]
+
+            elif "Expecting ',' delimiter" in e.msg and pos > 0:
+                # ClickUp rendered \" as plain " inside a string value,
+                # which closed the string prematurely.  The parser then
+                # sees the next word and expects ',' but gets text.
+                #
+                # Strategy: walk backward from the error to find the "
+                # that closed the string, and re-escape it as \".
+                q = pos - 1
+                while q >= 0 and text[q] in " \t\n\r":
+                    q -= 1
+                if q >= 0 and text[q] == '"' and (q == 0 or text[q - 1] != "\\"):
+                    text = text[:q] + '\\"' + text[q + 1:]
+                    prev_pos = -1  # position shifted, reset guard
+                else:
+                    snippet = text[max(0, pos - 30) : pos + 40]
+                    log.warning(
+                        "JSON repair: unfixable at pos %d: %s – …%s…",
+                        pos,
+                        e.msg,
+                        snippet.replace("\n", "↵"),
+                    )
+                    break
 
             else:
                 # Structural error we cannot auto-fix — log and bail out
