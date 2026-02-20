@@ -26,8 +26,12 @@ class Settings(BaseSettings):
     api_retries: int = 5               # retry count for transient errors
     api_retry_base_delay: float = 3.0  # base delay for exponential backoff
 
-    # Security – shared secret the SuperAgent must send
+    # Security – shared secret the SuperAgent must send (REST API)
     api_secret: str = ""
+
+    # OAuth 2.1 / MCP
+    jwt_secret: str = ""               # Secret for signing JWT tokens (auto-generated if blank)
+    oauth_issuer: str = ""             # Public base URL – auto-detected from request if blank
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

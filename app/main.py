@@ -13,7 +13,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import get_settings
-from app.routes import router
+from app.mcp_server import create_mcp_app
+from app.oauth import router as oauth_router
+from app.routes import router as api_router
 
 settings = get_settings()
 
@@ -26,10 +28,14 @@ logging.basicConfig(
 app = FastAPI(
     title="Gaia Orchestrator",
     description=(
-        "Receives a structured wiki payload from a ClickUp SuperAgent and "
-        "creates the corresponding Doc / pages in ClickUp via the API."
+        "Receives a structured wiki payload from a ClickUp SuperAgent (or MCP agent) "
+        "and creates the corresponding Doc / pages in ClickUp via the API.\n\n"
+        "## Endpoints\n"
+        "- **REST API** → `/api/v1/wiki` (direct HTTP)\n"
+        "- **MCP (SSE)** → `/mcp/sse` (for ClickUp AI Agents)\n"
+        "- **OAuth 2.1** → `/.well-known/oauth-authorization-server`\n"
     ),
-    version="1.0.0",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -43,7 +49,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(router)
+# REST API routes
+app.include_router(api_router)
+
+# OAuth 2.1 routes  (/.well-known/*, /oauth/*)
+app.include_router(oauth_router)
+
+# MCP server over SSE  (/mcp/sse, /mcp/messages/)
+app.mount("/mcp", create_mcp_app())
 
 log = logging.getLogger("gaia")
 
@@ -54,8 +67,12 @@ async def _startup():
         log.warning("CLICKUP_API_KEY is not set – wiki uploads will fail")
     else:
         log.info("CLICKUP_API_KEY loaded")
+
+    if settings.jwt_secret:
+        log.info("OAuth / MCP auth ENABLED (JWT_SECRET is set)")
+    else:
+        log.info("OAuth / MCP auth DISABLED (JWT_SECRET is blank – dev mode)")
+
     log.info(
-        "Gaia Orchestrator is ready  (http://%s:%s/docs)",
-        settings.host,
-        settings.port,
+        "Gaia Orchestrator ready  →  REST: /docs  |  MCP: /mcp/sse  |  OAuth: /.well-known/oauth-authorization-server",
     )
