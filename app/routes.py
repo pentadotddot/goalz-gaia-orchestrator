@@ -519,6 +519,46 @@ def _clean_rich_text(text: str) -> str:
     return text
 
 
+def _repair_json_strings(text: str) -> str:
+    """
+    Fix literal newlines/tabs inside JSON string values.
+
+    ClickUp's ``description`` field renders ``\\n`` escape sequences as
+    actual newline characters.  JSON strings cannot contain unescaped
+    newlines, so ``json.loads()`` fails.  This function walks the text
+    character-by-character, tracks whether it is inside a quoted string,
+    and re-escapes ``\\n``, ``\\r``, ``\\t`` that appear inside strings
+    while leaving structural whitespace untouched.
+    """
+    result: list[str] = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+            continue
+        if ch == "\\" and in_string:
+            result.append(ch)
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            continue
+        if in_string:
+            if ch == "\n":
+                result.append("\\n")
+                continue
+            if ch == "\r":
+                continue          # drop CR (keep only \n)
+            if ch == "\t":
+                result.append("\\t")
+                continue
+        result.append(ch)
+    return "".join(result)
+
+
 def _normalize_pages(pages: list) -> list:
     """Recursively normalise page dicts coming from the agent."""
     out = []
@@ -575,13 +615,15 @@ def _try_parse_wiki_json(text: str) -> dict | None:
         block = block.strip()
         if not block:
             continue
-        try:
-            data = json.loads(block)
-            if isinstance(data, dict) and "pages" in data:
-                log.debug("Parsed wiki JSON from fenced code block")
-                return _normalize_wiki_payload(data)
-        except (json.JSONDecodeError, ValueError):
-            pass
+        # Try raw, then repaired (ClickUp may render \n inside strings)
+        for candidate in [block, _repair_json_strings(block)]:
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict) and "pages" in data:
+                    log.debug("Parsed wiki JSON from fenced code block")
+                    return _normalize_wiki_payload(data)
+            except (json.JSONDecodeError, ValueError):
+                pass
 
     # ── Strategies 1-2: direct parse / substring extraction ──
     for attempt_text in [text.strip(), _clean_rich_text(text)]:
@@ -604,6 +646,17 @@ def _try_parse_wiki_json(text: str) -> dict | None:
             try:
                 data = json.loads(candidate)
                 if isinstance(data, dict) and "pages" in data:
+                    return _normalize_wiki_payload(data)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+            # Fallback: repair literal newlines inside JSON string values
+            # (ClickUp renders \n as actual line breaks in descriptions)
+            try:
+                repaired = _repair_json_strings(candidate)
+                data = json.loads(repaired)
+                if isinstance(data, dict) and "pages" in data:
+                    log.debug("Parsed wiki JSON after repairing newlines in strings")
                     return _normalize_wiki_payload(data)
             except (json.JSONDecodeError, ValueError):
                 pass
