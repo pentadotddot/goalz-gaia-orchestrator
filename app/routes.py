@@ -4,16 +4,21 @@ FastAPI routes for the Gaia Orchestrator wiki-creation service.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi.responses import PlainTextResponse
 
 from app.config import Settings, get_settings
 from app.models import (
     JobStatusResponse,
+    TargetLocation,
     WikiCreateRequest,
     WikiCreateResponse,
+    WikiPage,
     JobStatus,
 )
 from app.wiki_builder import get_job, list_jobs, run_wiki_creation
@@ -112,3 +117,120 @@ async def list_wiki_jobs():
 )
 async def health():
     return {"status": "ok"}
+
+
+# ── GET-based wiki creation (for ClickUp "Load web pages" tool) ──
+
+
+def _build_pages(raw: list[dict]) -> list[WikiPage]:
+    """Recursively convert raw dicts into WikiPage models."""
+    out: list[WikiPage] = []
+    for p in raw:
+        out.append(WikiPage(
+            title=p.get("title", "Untitled"),
+            content=p.get("content", ""),
+            children=_build_pages(p.get("children", [])),
+        ))
+    return out
+
+
+def _count_pages(pages: list[WikiPage]) -> int:
+    total = len(pages)
+    for p in pages:
+        total += _count_pages(p.children)
+    return total
+
+
+def _format_tree(pages, indent=0) -> str:
+    lines = []
+    for p in pages:
+        status = p.status if hasattr(p, "status") else ""
+        pid = p.clickup_page_id if hasattr(p, "clickup_page_id") else ""
+        prefix = "  " * indent
+        extra = f" (ID: {pid})" if pid else ""
+        stat = f" [{status}]" if status else ""
+        lines.append(f"{prefix}- {p.title}{extra}{stat}")
+        children = p.children if hasattr(p, "children") else []
+        if children:
+            lines.append(_format_tree(children, indent + 1))
+    return "\n".join(lines)
+
+
+@router.get(
+    "/wiki/create",
+    response_class=PlainTextResponse,
+    summary="Create wiki via GET (for ClickUp agent Load web pages tool)",
+    tags=["agent"],
+)
+async def create_wiki_get(
+    url: str = Query(..., description="ClickUp Doc/Page/Space URL"),
+    pages: str = Query(..., description="JSON array of pages: [{title, content, children}]"),
+    doc_name: str = Query(default="Wiki", description="Doc name (for new docs)"),
+    settings: Settings = Depends(get_settings),
+):
+    """
+    Create a wiki via GET request. Designed for ClickUp SuperAgent's
+    "Load web pages" tool.
+
+    The agent constructs a URL with `url` and `pages` (JSON) as query
+    parameters, then "loads" it. This endpoint triggers the wiki creation
+    and returns a plain-text result the agent can read.
+
+    Example:
+        /api/v1/wiki/create?url=https://app.clickup.com/...&doc_name=My+Wiki&pages=[{"title":"Hello","content":"# Hello","children":[]}]
+    """
+    if not settings.clickup_api_key:
+        return PlainTextResponse(
+            "ERROR: CLICKUP_API_KEY is not configured on the server.",
+            status_code=500,
+        )
+
+    # Parse pages JSON
+    try:
+        raw_pages = json.loads(pages)
+        if not isinstance(raw_pages, list) or len(raw_pages) == 0:
+            raise ValueError("pages must be a non-empty JSON array")
+        wiki_pages = _build_pages(raw_pages)
+    except (json.JSONDecodeError, ValueError) as e:
+        return PlainTextResponse(f"ERROR: Invalid pages parameter: {e}", status_code=400)
+
+    total = _count_pages(wiki_pages)
+
+    # Build request
+    request = WikiCreateRequest(
+        doc_name=doc_name,
+        target=TargetLocation(url=url),
+        pages=wiki_pages,
+    )
+
+    # Start job
+    job_id = await run_wiki_creation(request, settings)
+    log.info("GET wiki/create: job %s started (%d pages)", job_id, total)
+
+    # Wait for completion (up to ~3 min)
+    for _ in range(90):
+        await asyncio.sleep(2)
+        job = get_job(job_id)
+        if job and job.status.value in ("completed", "failed"):
+            break
+
+    job = get_job(job_id)
+    if not job:
+        return PlainTextResponse(f"ERROR: Job {job_id} not found.", status_code=500)
+
+    # Build human-readable result
+    lines = [
+        f"WIKI CREATION {'COMPLETED' if job.status.value == 'completed' else 'FAILED'}",
+        f"Job ID:    {job.job_id}",
+        f"Status:    {job.status.value}",
+        f"Doc ID:    {job.doc_id}",
+        f"Uploaded:  {job.uploaded}",
+        f"Failed:    {job.failed}",
+        "",
+        "Pages created:",
+        _format_tree(job.pages),
+    ]
+    if job.error:
+        lines.append(f"\nError: {job.error}")
+
+    return PlainTextResponse("\n".join(lines))
