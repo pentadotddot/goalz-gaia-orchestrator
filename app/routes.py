@@ -299,8 +299,21 @@ async def webhook_clickup(
         raise HTTPException(status_code=500, detail="CLICKUP_API_KEY not configured")
 
     # ── Find the wiki payload ──
-    wiki_payload = _find_wiki_payload(request_data)
 
+    # Priority 1: "payload" query parameter (from ClickUp URL Parameters + Task Description tag)
+    wiki_payload = None
+    payload_param = raw_request.query_params.get("payload", "")
+    if payload_param:
+        log.info("Webhook: found 'payload' query param (%d chars)", len(payload_param))
+        wiki_payload = _try_parse_wiki_json(payload_param)
+        if wiki_payload:
+            log.info("Webhook: extracted wiki JSON from 'payload' query param")
+
+    # Priority 2: look inside the parsed request body
+    if not wiki_payload:
+        wiki_payload = _find_wiki_payload(request_data)
+
+    # Priority 3: scan the raw body text
     if not wiki_payload:
         wiki_payload = _find_wiki_payload_in_text(body_text)
 
