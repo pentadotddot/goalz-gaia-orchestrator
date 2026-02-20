@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request as FastAPIRequest, status
 from fastapi.responses import PlainTextResponse
 
 from app.config import Settings, get_settings
@@ -245,7 +245,7 @@ async def create_wiki_get(
     tags=["webhook"],
 )
 async def webhook_clickup(
-    request: dict,
+    raw_request: FastAPIRequest,
     settings: Settings = Depends(get_settings),
 ):
     """
@@ -255,57 +255,67 @@ async def webhook_clickup(
     task description. The automation fires this webhook, and we
     extract the JSON from the task description field.
 
-    Tries multiple strategies to find the wiki payload:
-      1. Direct WikiCreateRequest format (body IS the payload)
-      2. Task description field containing JSON
-      3. Any string field containing valid wiki JSON
+    Also handles ClickUp's "Test webhook" button gracefully.
     """
+    # Parse body (accept any format)
+    body_bytes = await raw_request.body()
+    body_text = body_bytes.decode("utf-8", errors="replace")
+    log.info("Webhook received (%d bytes): %.500s", len(body_bytes), body_text)
+
+    # Try to parse as JSON
+    request_data: dict = {}
+    try:
+        parsed = json.loads(body_text) if body_text.strip() else {}
+        if isinstance(parsed, dict):
+            request_data = parsed
+        elif isinstance(parsed, list) and len(parsed) > 0 and isinstance(parsed[0], dict):
+            request_data = parsed[0]
+    except (json.JSONDecodeError, ValueError):
+        log.info("Webhook: body is not JSON, treating as raw text")
+
+    # Also check query parameters
+    for key, value in raw_request.query_params.items():
+        if key not in request_data:
+            request_data[key] = value
+
+    # ── Test webhook detection ──
+    # ClickUp test webhooks send sample/placeholder data.
+    # Accept them with 200 so the test passes.
+    is_test = (
+        not body_text.strip()
+        or body_text.strip() in ("{}", "[]", "null", "test")
+        or request_data.get("event") == "test"
+        or (not _find_wiki_payload(request_data) and not _find_wiki_payload_in_text(body_text))
+    )
+
+    if is_test and "pages" not in request_data:
+        log.info("Webhook: test/empty payload detected – returning 200 OK")
+        return {
+            "status": "ok",
+            "message": "Webhook received successfully. Send a task with wiki JSON in the description to create pages.",
+        }
+
     if not settings.clickup_api_key:
         raise HTTPException(status_code=500, detail="CLICKUP_API_KEY not configured")
 
-    log.info("Webhook received: %s", json.dumps(request, default=str)[:500])
-
-    wiki_payload = None
-
-    # Strategy 1: body is already our WikiCreateRequest format
-    if "pages" in request and "target" in request:
-        wiki_payload = request
-        log.info("Webhook: payload is direct WikiCreateRequest format")
-
-    # Strategy 2: look for task description containing JSON
-    if not wiki_payload:
-        description = (
-            request.get("task_description")
-            or request.get("description")
-            or request.get("Task Description")
-            or ""
-        )
-        if description:
-            wiki_payload = _try_parse_wiki_json(description)
-            if wiki_payload:
-                log.info("Webhook: extracted payload from task description")
-
-    # Strategy 3: scan all string values for valid wiki JSON
-    if not wiki_payload:
-        for key, value in request.items():
-            if isinstance(value, str) and len(value) > 20:
-                wiki_payload = _try_parse_wiki_json(value)
-                if wiki_payload:
-                    log.info("Webhook: extracted payload from field '%s'", key)
-                    break
+    # ── Find the wiki payload ──
+    wiki_payload = _find_wiki_payload(request_data)
 
     if not wiki_payload:
-        log.error("Webhook: could not find wiki payload in request")
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Could not find wiki JSON payload in the webhook data. "
-                "Make sure the task description contains the full wiki JSON: "
+        wiki_payload = _find_wiki_payload_in_text(body_text)
+
+    if not wiki_payload:
+        log.warning("Webhook: no wiki payload found – returning guidance")
+        return {
+            "status": "ignored",
+            "message": (
+                "No wiki JSON payload found in the webhook data. "
+                "The task description should contain JSON like: "
                 '{"doc_name": "...", "target": {"url": "..."}, "pages": [...]}'
             ),
-        )
+        }
 
-    # Build request and start job
+    # ── Build request and start job ──
     try:
         pages = _build_pages(wiki_payload.get("pages", []))
         target_data = wiki_payload.get("target", {})
@@ -319,17 +329,59 @@ async def webhook_clickup(
         )
     except Exception as e:
         log.error("Webhook: invalid payload structure: %s", e)
-        raise HTTPException(status_code=400, detail=f"Invalid wiki payload: {e}")
+        return {"status": "error", "message": f"Invalid wiki payload: {e}"}
 
     job_id = await run_wiki_creation(wiki_request, settings)
-    log.info("Webhook: job %s started (%d pages)", job_id, _count_pages(pages))
+    total = _count_pages(pages)
+    log.info("Webhook: job %s started (%d pages)", job_id, total)
 
     return {
         "status": "accepted",
         "job_id": job_id,
-        "total_pages": _count_pages(pages),
+        "total_pages": total,
         "message": "Wiki creation started",
     }
+
+
+def _find_wiki_payload(data: dict) -> dict | None:
+    """Try to find a wiki payload in a dict (direct or nested in fields)."""
+    if not data:
+        return None
+
+    # Strategy 1: body IS the payload
+    if "pages" in data and ("target" in data or "doc_name" in data):
+        return data
+
+    # Strategy 2: task description fields
+    for field in [
+        "task_description", "description", "Task Description",
+        "task_content", "content", "body", "text",
+    ]:
+        value = data.get(field, "")
+        if isinstance(value, str) and value:
+            result = _try_parse_wiki_json(value)
+            if result:
+                return result
+
+    # Strategy 3: scan all string values
+    for key, value in data.items():
+        if isinstance(value, str) and len(value) > 20:
+            result = _try_parse_wiki_json(value)
+            if result:
+                return result
+        elif isinstance(value, dict):
+            result = _find_wiki_payload(value)
+            if result:
+                return result
+
+    return None
+
+
+def _find_wiki_payload_in_text(text: str) -> dict | None:
+    """Try to find wiki JSON anywhere in raw text."""
+    if not text or len(text) < 10:
+        return None
+    return _try_parse_wiki_json(text)
 
 
 def _try_parse_wiki_json(text: str) -> dict | None:
