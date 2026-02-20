@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request as FastAPIRequest, status
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request as FastAPIRequest, status
 from fastapi.responses import PlainTextResponse
 
 from app.config import Settings, get_settings
@@ -246,6 +246,30 @@ async def create_wiki_get(
 )
 async def webhook_clickup(
     raw_request: FastAPIRequest,
+    payload: dict = Body(
+        default={},
+        examples=[
+            {
+                "doc_name": "Test Wiki",
+                "target": {
+                    "url": "https://app.clickup.com/90151997238/v/dc/2kyqmktp-35355/2kyqmktp-581535"
+                },
+                "pages": [
+                    {
+                        "title": "Welcome",
+                        "content": "# Welcome\n\nTest wiki page.",
+                        "children": [
+                            {
+                                "title": "Getting Started",
+                                "content": "## Getting Started\n\nChild page.",
+                                "children": [],
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    ),
     settings: Settings = Depends(get_settings),
 ):
     """
